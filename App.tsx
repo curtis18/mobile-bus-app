@@ -47,6 +47,16 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 SplashScreen.preventAutoHideAsync();
 
+// Resolve to `fallback` if `promise` doesn't settle within `ms`. Used to guard
+// the location-permission flow: on some Android devices the consent Alert or the
+// native permission dialog can silently fail to appear, leaving the promise
+// pending forever. Without a guard that would block geolocation indefinitely.
+const withTimeout = <T,>(promise: Promise<T>, ms: number, fallback: T): Promise<T> =>
+  Promise.race([
+    promise,
+    new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ]);
+
 const useAppIsInForeground = () => {
   const appState = useRef(AppState.currentState);
   const [appIsInForeground, setAppIsInForeground] = useState(true);
@@ -104,20 +114,27 @@ export default function App() {
       // background location (arrival reminder), so the disclosure states that
       // location may be collected even when the app is closed or not in use.
       if (Platform.OS === "android" && existing.canAskAgain) {
-        const consented = await AsyncConsent(
-          "位置資料使用 / Location data",
-          "「巴士到站預報」會使用你的位置資料，以顯示附近的巴士路線及車站，"
-            + "並可在你接近所選車站時提示到站，即使應用程式已關閉或沒有在使用中。"
-            + "位置資料只用於上述功能。\n\n"
-            + "hkbus.app collects location data to show nearby bus routes and stops, "
-            + "and to alert you when you are approaching your selected stop — even when "
-            + "the app is closed or not in use. Location is used only for these features.",
-          "允許 / Allow",
-          "不允許 / Don't allow",
+        // Guard the consent Alert with a timeout: if it never appears (a known
+        // cold-start failure mode on some Android devices), treat it as not
+        // consented rather than hanging forever.
+        const consented = await withTimeout(
+          AsyncConsent(
+            "位置資料使用 / Location data",
+            "「巴士到站預報」會使用你的位置資料，以顯示附近的巴士路線及車站，"
+              + "並可在你接近所選車站時提示到站，即使應用程式已關閉或沒有在使用中。"
+              + "位置資料只用於上述功能。\n\n"
+              + "hkbus.app collects location data to show nearby bus routes and stops, "
+              + "and to alert you when you are approaching your selected stop — even when "
+              + "the app is closed or not in use. Location is used only for these features.",
+            "允許 / Allow",
+            "不允許 / Don't allow",
+          ),
+          30000,
+          false,
         );
         if (!consented) {
-          // User declined the disclosure: do not request the permission. Load
-          // the app without location features.
+          // User declined the disclosure (or it failed to appear): do not
+          // request the permission. Load the app without location features.
           setLocationPermission({
             ...existing,
             status: LocationPermissionStatus.DENIED,
@@ -126,7 +143,20 @@ export default function App() {
           return;
         }
       }
-      setLocationPermission(await requestForegroundPermissionsAsync());
+      // Guard the native permission dialog the same way: if it doesn't resolve,
+      // fall back to the last-known (denied) state so geolocation stays off
+      // instead of leaving the permission state undetermined forever.
+      setLocationPermission(
+        await withTimeout(
+          requestForegroundPermissionsAsync(),
+          30000,
+          {
+            ...existing,
+            status: LocationPermissionStatus.DENIED,
+            granted: false,
+          },
+        ),
+      );
     })();
   }, []);
 
@@ -301,16 +331,19 @@ export default function App() {
     }
   }, [locationPermission]);
 
-  const readyToLoad = useMemo<boolean>(() => {
+  // Once the permission flow resolves to a definite status, reflect it in
+  // geolocationStatus. This no longer gates rendering — the WebView mounts
+  // immediately (see below) so the splash screen always dismisses on load,
+  // independent of how/whether the permission flow completes.
+  useEffect(() => {
     if (
       locationPermission === null ||
       locationPermission.status === undefined ||
       locationPermission.status === LocationPermissionStatus.UNDETERMINED
     ) {
-      return false;
+      return;
     }
-    setGeolocationStatus(locationPermission.granted ? "granted" : "closed")
-    return true;
+    setGeolocationStatus(locationPermission.granted ? "granted" : "closed");
   }, [locationPermission, locationPermission?.status]);
 
   useEffect(() => {
@@ -332,17 +365,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if ( readyToLoad ) {
-      webViewRef?.current?.postMessage(
-        JSON.stringify({
-          type: "geoPermission",
-          value: geolocationStatus,
-        })
-      );
-      console.log("post geoPermission: "+JSON.stringify(geolocationStatus))
-      postAlarmToWebView(webViewRef)
-    }
-  }, [readyToLoad, geolocationStatus]);
+    // Push the current permission status to the web app whenever it changes.
+    // The initial value is also posted from the WebView's onLoadEnd, so a value
+    // posted here before the page has loaded is harmless.
+    webViewRef?.current?.postMessage(
+      JSON.stringify({
+        type: "geoPermission",
+        value: geolocationStatus,
+      })
+    );
+    console.log("post geoPermission: "+JSON.stringify(geolocationStatus))
+    postAlarmToWebView(webViewRef)
+  }, [geolocationStatus]);
 
   const runFirst = useMemo(
     () => `
@@ -414,9 +448,16 @@ export default function App() {
     webViewRef.current?.reload();
   }, []);
 
-  if (!readyToLoad) {
-    return <></>;
-  }
+  // Final safety net: hide the splash screen unconditionally a few seconds after
+  // mount. onLoadEnd is the normal path, but if it never fires (e.g. the error
+  // view is shown before the page finishes loading) this guarantees the user is
+  // never left staring at the splash screen.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      SplashScreen.hideAsync().catch(() => {});
+    }, 8000);
+    return () => clearTimeout(t);
+  }, []);
 
   const uri = url?.startsWith("https://hkbus.app") ? url : "https://hkbus.app/";
 
