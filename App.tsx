@@ -482,6 +482,18 @@ export default function App() {
     webViewRef.current?.reload();
   }, []);
 
+  // When the app returns to the foreground, some Android WebViews don't fire
+  // `visibilitychange`, so the web app's ETA polling stays paused and every
+  // time is stuck "loading". Dispatch a `focus` event into the page to force
+  // it to resume (the web app listens for focus/pageshow to re-enable polling).
+  useEffect(() => {
+    if (appIsInForeground) {
+      webViewRef.current?.injectJavaScript(
+        "window.dispatchEvent(new Event('focus')); true;"
+      );
+    }
+  }, [appIsInForeground]);
+
   // Final safety net: hide the splash screen unconditionally a few seconds after
   // mount. onLoadEnd is the normal path, but if it never fires (e.g. the error
   // view is shown before the page finishes loading) this guarantees the user is

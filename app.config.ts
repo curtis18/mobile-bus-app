@@ -6,7 +6,7 @@ module.exports = ({ config }: ConfigContext): ExpoConfig => {
     ...config,
     name: '巴士到站預報 - hkbus.app',
     slug: 'hkbus', // Replace with your app's slug
-    version: '2.10.3', // Your app's version
+    version: '2.10.4', // Your app's version
     orientation: 'portrait',
     icon: './assets/icon.png',
     updates: {
@@ -96,7 +96,7 @@ module.exports = ({ config }: ConfigContext): ExpoConfig => {
         backgroundColor: '#000000'
       },
       package: 'app.hkbus',
-      versionCode: 50,
+      versionCode: 51,
       intentFilters: [
         {
           action: 'VIEW',
