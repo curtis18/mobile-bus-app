@@ -57,6 +57,11 @@ const withTimeout = <T,>(promise: Promise<T>, ms: number, fallback: T): Promise<
     new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
   ]);
 
+// AsyncStorage key that persists the user's decline of the location disclosure,
+// so the disclosure isn't re-shown on every launch. Cleared when the user later
+// opts in via an explicit action.
+const CONSENT_DECLINED_KEY = "locationConsentDeclined";
+
 const useAppIsInForeground = () => {
   const appState = useRef(AppState.currentState);
   const [appIsInForeground, setAppIsInForeground] = useState(true);
@@ -102,39 +107,29 @@ export default function App() {
   const [locationPermission, setLocationPermission] =
     useState<LocationPermissionResponse | null>(null);
 
-  useEffect(() => {
-    (async () => {
-      const existing = await getForegroundPermissionsAsync();
-      if (existing.granted) {
-        setLocationPermission(existing);
-        return;
-      }
-      // Google Play's User Data policy requires a prominent disclosure shown
-      // BEFORE any location permission is requested. This app also uses
-      // background location (arrival reminder), so the disclosure states that
-      // location may be collected even when the app is closed or not in use.
-      if (Platform.OS === "android" && existing.canAskAgain) {
-        // Guard the consent Alert with a timeout: if it never appears (a known
-        // cold-start failure mode on some Android devices), treat it as not
-        // consented rather than hanging forever.
-        const consented = await withTimeout(
-          AsyncConsent(
-            "位置資料使用 / Location data",
-            "「巴士到站預報」會使用你的位置資料，以顯示附近的巴士路線及車站，"
-              + "並可在你接近所選車站時提示到站，即使應用程式已關閉或沒有在使用中。"
-              + "位置資料只用於上述功能。\n\n"
-              + "hkbus.app collects location data to show nearby bus routes and stops, "
-              + "and to alert you when you are approaching your selected stop — even when "
-              + "the app is closed or not in use. Location is used only for these features.",
-            "允許 / Allow",
-            "不允許 / Don't allow",
-          ),
-          30000,
-          false,
-        );
-        if (!consented) {
-          // User declined the disclosure (or it failed to appear): do not
-          // request the permission. Load the app without location features.
+  // Runs the location-permission flow: the prominent disclosure (Android, a
+  // Google Play requirement) followed by the OS permission request.
+  // `force` = true is an explicit user action (e.g. tapping "use my location")
+  // and always re-shows the disclosure even after a prior decline.
+  // `force` = false is the automatic launch path, which honors a persisted
+  // decline and stays silent so the dialog isn't shown on every launch.
+  const requestLocationWithConsent = useCallback(async (force: boolean = false) => {
+    const existing = await getForegroundPermissionsAsync();
+    if (existing.granted) {
+      AsyncStorage.removeItem(CONSENT_DECLINED_KEY);
+      setLocationPermission(existing);
+      return;
+    }
+    // Google Play's User Data policy requires a prominent disclosure shown
+    // BEFORE any location permission is requested. This app also uses
+    // background location (arrival reminder), so the disclosure states that
+    // location may be collected even when the app is closed or not in use.
+    if (Platform.OS === "android" && existing.canAskAgain) {
+      // On an automatic launch, respect a previously persisted decline and do
+      // not re-prompt. The user can still opt in later via a forced request.
+      if (!force) {
+        const declined = await AsyncStorage.getItem(CONSENT_DECLINED_KEY);
+        if (declined === "true") {
           setLocationPermission({
             ...existing,
             status: LocationPermissionStatus.DENIED,
@@ -143,22 +138,57 @@ export default function App() {
           return;
         }
       }
-      // Guard the native permission dialog the same way: if it doesn't resolve,
-      // fall back to the last-known (denied) state so geolocation stays off
-      // instead of leaving the permission state undetermined forever.
-      setLocationPermission(
-        await withTimeout(
-          requestForegroundPermissionsAsync(),
-          30000,
-          {
-            ...existing,
-            status: LocationPermissionStatus.DENIED,
-            granted: false,
-          },
+      // Guard the consent Alert with a timeout: if it never appears (a known
+      // cold-start failure mode on some Android devices), treat it as not
+      // consented rather than hanging forever.
+      const consented = await withTimeout(
+        AsyncConsent(
+          "位置資料使用 / Location data",
+          "「巴士到站預報」會使用你的位置資料，以顯示附近的巴士路線及車站，"
+            + "並可在你接近所選車站時提示到站，即使應用程式已關閉或沒有在使用中。"
+            + "位置資料只用於上述功能。\n\n"
+            + "hkbus.app collects location data to show nearby bus routes and stops, "
+            + "and to alert you when you are approaching your selected stop — even when "
+            + "the app is closed or not in use. Location is used only for these features.",
+          "允許 / Allow",
+          "不允許 / Don't allow",
         ),
+        30000,
+        false,
       );
-    })();
+      if (!consented) {
+        // Persist the decline so the disclosure isn't shown on every launch,
+        // and load the app without location features.
+        await AsyncStorage.setItem(CONSENT_DECLINED_KEY, "true");
+        setLocationPermission({
+          ...existing,
+          status: LocationPermissionStatus.DENIED,
+          granted: false,
+        });
+        return;
+      }
+      // Consented: clear any prior decline before requesting.
+      await AsyncStorage.removeItem(CONSENT_DECLINED_KEY);
+    }
+    // Guard the native permission dialog the same way: if it doesn't resolve,
+    // fall back to the last-known (denied) state so geolocation stays off
+    // instead of leaving the permission state undetermined forever.
+    setLocationPermission(
+      await withTimeout(
+        requestForegroundPermissionsAsync(),
+        30000,
+        {
+          ...existing,
+          status: LocationPermissionStatus.DENIED,
+          granted: false,
+        },
+      ),
+    );
   }, []);
+
+  useEffect(() => {
+    requestLocationWithConsent(false);
+  }, [requestLocationWithConsent]);
 
   // requestForegroundPermissionsAsync may sometimes get stuck on Android when the permission has already been granted before
   // const [locationPermission] = useForegroundPermissions({
@@ -270,10 +300,14 @@ export default function App() {
       if (message.type === "start-geolocation") {
         if (locationPermission?.granted) {
           setGeolocationStatus("granted");
-        } else if (message.force || locationPermission?.canAskAgain) {
-          requestForegroundPermissionsAsync().then(({ status }) => {
-            setGeolocationStatus(status === LocationPermissionStatus.GRANTED ? "granted" : "closed");
-          });
+        } else if (message.force) {
+          // Explicit user action (e.g. tapping "use my location"): re-run the
+          // full flow, clearing any prior decline. geolocationStatus updates via
+          // the locationPermission effect once the request resolves.
+          requestLocationWithConsent(true);
+        } else if (locationPermission?.canAskAgain) {
+          // Automatic request: honors a persisted decline inside the flow.
+          requestLocationWithConsent(false);
         } else {
           setGeolocationStatus("closed");
         }
@@ -329,7 +363,7 @@ export default function App() {
     } catch (err) {
       console.log("UNKNOWN message:", e);
     }
-  }, [locationPermission]);
+  }, [locationPermission, requestLocationWithConsent]);
 
   // Once the permission flow resolves to a definite status, reflect it in
   // geolocationStatus. This no longer gates rendering — the WebView mounts
