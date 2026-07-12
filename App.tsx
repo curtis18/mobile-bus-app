@@ -44,6 +44,10 @@ import { postAlarmToWebView, toggleAlarm } from "./stopAlarm";
 import { AsyncConsent } from "./asyncAlert";
 import * as ExpoLinking from "expo-linking";
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import {
+  SafeAreaProvider,
+  useSafeAreaInsets,
+} from "react-native-safe-area-context";
 
 SplashScreen.preventAutoHideAsync();
 
@@ -88,7 +92,8 @@ const useAppIsInForeground = () => {
   return appIsInForeground;
 };
 
-export default function App() {
+function AppContent() {
+  const insets = useSafeAreaInsets();
   const appIsInForeground = useAppIsInForeground();
   const rawColorScheme = useColorScheme();
   // RN 0.85's useColorScheme() now returns 'light' | 'dark' | 'unspecified'
@@ -208,6 +213,41 @@ export default function App() {
   const webViewUrl = useRef<string>("");
   const readyToExit = useRef<Boolean>(false)
   const webViewRef = useRef<WebView>(null);
+
+  // Under enforced edge-to-edge the WebView draws full-height behind the system
+  // navigation bar, and the web app reserves space for it via
+  // `body { padding-bottom: env(safe-area-inset-bottom) }` (see the web app's
+  // index.css). But Android System WebView 138+ reports env(safe-area-inset-*)
+  // as 0 (react-native-webview #3828), so on those devices the web app can't
+  // reserve the space and the 3-button nav bar covers the bottom of the page;
+  // on older WebViews env() over-reports and the UI floats too high. Both are
+  // the same root cause: env() is unreliable. react-native-safe-area-context
+  // reports the true inset on every WebView version, so inject it as an
+  // `!important` body padding-bottom that overrides whatever env() resolves to.
+  // Android only: iOS WKWebView reports env(safe-area-inset-*) correctly.
+  const applyAndroidSafeAreaInsets = useCallback(() => {
+    if (Platform.OS !== "android") return;
+    webViewRef.current?.injectJavaScript(`
+      (function () {
+        var id = "rn-safe-area-inset";
+        var el = document.getElementById(id);
+        if (!el) {
+          el = document.createElement("style");
+          el.id = id;
+          document.head.appendChild(el);
+        }
+        el.textContent = "body{padding-bottom:${insets.bottom}px !important;}";
+      })();
+      true;
+    `);
+  }, [insets.bottom]);
+
+  // Re-apply whenever the inset changes (e.g. the user switches navigation
+  // mode or the bar shows/hides). A full page reload recreates the DOM and
+  // drops the injected <style>, so onLoadEnd re-applies it too.
+  useEffect(() => {
+    applyAndroidSafeAreaInsets();
+  }, [applyAndroidSafeAreaInsets]);
 
   // Handle Back press behaviour
   useEffect(() => {
@@ -600,6 +640,7 @@ export default function App() {
             onNavigationStateChange={handleWebViewNavigationStateChange}
             onLoadEnd={() => {
               SplashScreen.hide()
+              applyAndroidSafeAreaInsets()
               webViewRef?.current?.postMessage(
                 JSON.stringify({
                   type: "geoPermission",
@@ -613,6 +654,14 @@ export default function App() {
           />
       </View>
     </>
+  );
+}
+
+export default function App() {
+  return (
+    <SafeAreaProvider>
+      <AppContent />
+    </SafeAreaProvider>
   );
 }
 
